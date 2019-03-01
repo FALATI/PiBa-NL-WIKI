@@ -1,0 +1,226 @@
+How to building a pfSense .iso from sources
+PiBa-NL edited this page on 18 Apr 2018 · 9 revisions
+My steps for building a pfSense 2.4.3dev / FreeBSD 11.1 .iso file. Stuff might be missing, and stuff will change over time, and might not be updated.
+
+Hope this helps you get started at least part of the way. It is still a work in progress, and as you can see ive used MyFirewall as the productname for now..
+
+Prepare a VM to build on
+Create VirtualMachine on your favorite hypervisor platform.
+
+CPU: as much as you can spare (building takes a long time and is cpu intensive.. 16 or more vCPU's can be nice to have.)
+Mem: 8 GB prefered, no less than 4164MB(to have zfs prefetch enabled..)
+Disk: 30 GB should be sufficient
+Install / configure FreeBSD
+Install the version of FreeBSD that pfsense needs. 11.1 in this case.
+
+allow root to login over ssh (NEVER DO THIS on a production machine, only for testing/easy access)
+echo PermitRootLogin yes >> /etc/ssh/sshd_config
+service sshd restart
+Installing required packages on the the build machine for building the sources..
+echo ## Installing required packages
+pkg install -y pkg
+pkg install -y git
+pkg install -y poudriere-devel
+pkg install -y mkfile
+pkg install -y rsync
+pkg install -y nginx
+pkg install -y unbound
+Configure Nginx to host the package repository on the buildmachine itself
+Add to /usr/local/etc/nginx/nginx.conf inside the server { .. } part:
+
+    location /ce/packages/MyFirewall_MyFirewall_2_4_amd64-MyFirewall_devel {
+		alias /usr/local/poudriere/data/packages/MyFirewall_MyFirewall_2_4_amd64-MyFirewall_devel;
+		autoindex on;
+    }
+Do we need this one as well?: (To install a pre-build pkg from for example.?. which seems to be required during build iso)
+
+    location /ce/packages/MyFirewall_MyFirewall_2_4_amd64-core {
+		alias /usr/local/poudriere/data/packages/MyFirewall_MyFirewall_2_4_amd64-MyFirewall_devel;
+		autoindex on;
+    }
+Start the nginx service: service nginx onestart
+
+DNS
+Make sure the dns record release-staging.piba-nl.nl A record points back to the nginx pkg webserver machine.. In this case we are using Unbound on the buildmachine for this task.
+
+Put the localhost nameserver in /etc/resolv.conf so the system will know to use the local unbound installation:
+--- /etc/resolv.conf ---
+
+nameserver 127.0.0.1
+Create the unbound.conf configuration file, pointing the domainname used for the 'package webserver' (the IP of the buildmachine running nginx):
+--- /root/unbound.conf ---
+
+server:  
+port: 53  
+interface: 0.0.0.0  
+local-zone: "piba-nl.nl." static  
+local-data: "release-staging.piba-nl.nl. IN A 192.168.0.93"  
+forward-zone:  
+name: "."  
+forward-addr: 192.168.0.1@53  
+And start unbound with:
+
+unbound -c /root/unbound.conf
+Preparing the environment
+Installing optional packages
+Install tools that can manage the machine and build process to debug stuff..
+screen allows closing ssh session without stopping the running build commands.
+ag from the_silver_searcher is a fast code/script/text searcher, if you want to find where a variable is used/defined or a error message might be generated.
+htop is a nice 'graphical' top.
+
+pkg install -y screen
+pkg install -y the_silver_searcher
+pkg install -y htop
+rehash
+screen
+Installing official ports tree as some files are read from /etc/ports/..
+(todo find out what exactly.., should it perhaps just be a copy of the FreeBSD-Ports forked repository?)
+
+portsnap fetch extract
+Generate repository signing key
+This should be hosted on some secure private signing server
+
+cd /root/
+openssl genrsa -out repo.key 2048
+chmod 0400 repo.key
+openssl rsa -in repo.key -out repo.pub -pubout
+sh -c '( echo "function: sha256"; echo "fingerprint: $(sha256 -q repo.pub)"; ) > fingerprint'
+
+echo # then it would call the below script from pkg over a ssh connection, for now make it available locally..
+cd /root
+echo "#\!/bin/sh" > sign.sh
+echo "read -t 2 sum" >> sign.sh
+echo "[ -z "\"\$sum\"" ] && exit 1" >> sign.sh
+echo "echo SIGNATURE" >> sign.sh
+echo "echo -n "\$sum" | openssl dgst -sign /root/repo.key -sha256 -binary" >> sign.sh
+echo "echo" >> sign.sh
+echo "echo CERT" >> sign.sh
+echo "cat repo.pub" >> sign.sh
+echo "echo END" >> sign.sh
+chmod +x /root/sign.sh
+
+echo # 'zroot' zfs volume is required for poudriere (not needed if base FreeBSD system is also installed with ZFS)
+cd /usr/MyFirewall/ && mkfile 4G file1
+zpool create zroot /usr/MyFirewall/file1
+zpool list
+Forking repositories. Fork and change the following.
+If you use my git repository, it should work as a proof of concept on what is needed to build, but it will be outdated.. and I'm not intending to keep up with new/recent commits changes.. You can however check what commits i added to the 3 repositories to make the MyFirewall build succeed, so you can make similar changes in your own forks..
+
+(==Repository : old-branche > new-branche==)
+
+== pfSense : master > MyFirewall_2_4 ==
+Create file: /build.conf using build.conf.sample as a example.
+Make sure to set the following options adapted for your domain and git-repositories:
+
+ export PRODUCT_NAME="MyFirewall"
+ export FREEBSD_REPO_BASE=https://github.com/PiBa-NL/FreeBSD-src.git
+ export FREEBSD_BRANCH=MyFirewall_2_4
+ export PKG_REPO_SERVER_STAGING="pkg+http://release-staging.piba-nl.nl/ce/packages"
+ export PKG_REPO_SIGNING_COMMAND="/root/sign.sh ${PKG_REPO_SIGN_KEY}"
+== FreeBSD-src : RELENG_2_4 > MyFirewall_2_4 ==
+Create files from their original counterparts:
+
+/release/conf/MyFirewall*.conf 3x conf
+/sys/amd64/conf/MyFirewall
+== FreeBSD-ports : devel > devel ==
+/sysutils/pfSense-upgrade/files/MyFirewall-upgrade
+/sysutils/pfSense-upgrade/files/MyFirewall-upgrade.wrapper
+Build the sources
+Once the repositories are prepared with all desired/required changes the checkout of repositories and compiling of code and kernel can be done.
+
+Checkout the sources from the main repository
+cd /usr && git clone -b MyFirewall_2_4 https://github.com/PiBa-NL/pfsense.git MyFirewall
+Now the heavy work starts, several of below steps with 'time' command can take multiple hours to complete
+Create the JAIL where the actual compilation of sources will happen in.
+If ran a second time the old jail is deleted. (If it appears to do nothing press 'y' and 'enter'..)
+Processing time 32 minutes on a 8core+8hyperthreads machine.. Check log in case of problems: /usr/MyFirewall/logs/poudriere.log (it grew to 84MB on first time)
+
+cd /usr/MyFirewall/ && time ./build.sh --setup-poudriere
+Expected output last lines:
+
+Done!
+>>> Poudriere is now configured!
+>>> Operation ./build.sh has ended at Fri Mar 2 22:47:19 CET 2018
+21972.730u 4099.210s 32:32.33 1335.4% 55171+716k 960962+3220355io 742933pf+0w
+
+This will checkout git ports and rename them from pfSense-pkg-packagename to MyFirewall-pkg-packagename
+cd /usr/MyFirewall/ && ./build.sh --update-poudriere-ports
+Done!
+>>> Operation ./build.sh has ended at Fri Mar 2 22:50:19 CET 2018
+
+Compile all +-500 'ports'..
+After this step the files from /usr/local/poudriere/data/packages/MyFirewall_MyFirewall_2_4_amd64-MyFirewall_devel/ can be used to create the package repository make sure it is accessible and matching the servername/url configured in the build.conf. http://release-staging.piba-nl.nl/ce/packages/MyFirewall_MyFirewall_2_4_amd64-MyFirewall_devel/All/
+Processing time 1 hour 11 minutes on a 8core+8hyperthreads machine..
+
+cd /usr/MyFirewall/ && time ./build.sh --update-pkg-repo
+Check for progress/problems
+
+/usr/local/poudriere/data/logs/bulk/MyFirewall_MyFirewall_2_4_amd64-MyFirewall_devel/latest/logs
+/usr/local/poudriere/data/logs/bulk/latest-per-pkg/
+/usr/MyFirewall/logs/poudriere.log
+>>> Signing repository... Failed!
+>>> ERROR: An error occurred trying to sign repo
+
+####################################
+Something went wrong, check errors!
+####################################
+
+NOTE: a lot of times you can run './build.sh --clean-builder' to resolve.
+
+Log saved on /usr/MyFirewall/logs/poudriere.log
+
+Terminated
+22997.474u 10366.334s 1:11:49.50 774.1% 34195+502k 2380987+3790353io 2964964pf+108w
+
+Okay poudriere.log tells me i forgot to chmod +x the sign.sh file, so did that and kicked off the --update-pkg-repo again:
+
+>>> Signing repository... Done!
+>>> Signing Latest/pkg.txz for bootstraping... Done!
+>>> Operation ./build.sh has ended at Sat Mar 3 00:53:53 CET 2018
+66.055u 62.870s 0:37.36 345.0% 2910+245k 48573+47369io 10269pf+0w
+
+Checkout the FreeBSD-src git sources and compile the kernel..
+Processing time 10 minutes on a 8core+8hyperthreads machine..
+
+cd /usr/MyFirewall/ && time ./build.sh --build-kernels
+====>> Creating core package kernel
+====>> Removing immutable flags from /tmp/kernel.jEBcNgk
+====>> Removing recursively /tmp/kernel.jEBcNgk
+>>> Operation ./build.sh has ended at Sat Mar 3 01:08:52 CET 2018
+1708.647u 207.588s 9:49.23 325.2% 44708+596k 65226+1073592io 389666pf+0w
+
+Pulls packages from the earlier created repositories and should if all go's well create the MyFirewall.iso file..
+Processing time ** minutes** on a 8core+8hyperthreads machine..
+
+cd /usr/MyFirewall/ && time ./build.sh -i iso
+>>> /usr/MyFirewall/tmp/MyFirewall/ now contains:
+/usr/MyFirewall/tmp/MyFirewall/installer/MyFirewall-CE-2.4.3-DEVELOPMENT-amd64-20180303-0229.iso.gz
+>>> Operation ./build.sh has ended at Sat Mar 3 02:43:38 CET 2018
+954.347u 468.685s 13:56.90 170.0% 818+220k 131060+420973io 193848pf+0w
+
+Check for progress/problems:
+
+/usr/MyFirewall/logs/install_pkg_install_ports.txt
+/usr/MyFirewall/logs/buildworld.amd64
+Troubleshooting..
+Check the logs.
+Often they will provide a clue about what happened.. Also check onscreen output. If all else fails read the buildscripts and try to find what step could possibly be failing.. There might be a mismatch between ports and pfSense repository expectations. Also not all faults are 'fatal'.. Some can be ignored (without immediately visible issues..)
+
+Once you find a problem try and find any status/progress/error messages that surround it
+
+Start over from nothing..
+Even though it will take several hours again.. sometimes its best to just start fresh again.. DELETE OLD FILES :
+
+cd /usr/MyFirewall
+# Resets jail file permissions that otherwise might prevent deletion..
+chflags -R noschg *
+cd ..
+# Delete 'everything' .?
+rm -r MyFirewall
+After this the poudriere ports still exist.. Delete those as well.? Or they wont harm the new build.?...
+ Pages 2
+Find a Page…
+Home
+How to building a pfSense .iso from sources
+Clone this wiki locally
+https://github.com/PiBa-NL/PiBa-NL-WIKI.wiki.git
